@@ -8,4 +8,7 @@ edition = "2018"
 
 [dependencies]
 clap = "2.33.0"
+log = "0.4.8"
+stderrlog = "0.4.1"
+md-5 = "0.8.0"
 nom = "5.0.0"
