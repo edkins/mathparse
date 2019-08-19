@@ -9,7 +9,8 @@ use nom::combinator::all_consuming;
 use nom::error::{ErrorKind,ParseError};
 use nom::number::complete::{be_i8,be_i16,be_i32,be_i64,be_u8,be_u16,be_u24,be_u32,be_u64};
 
-use crate::types::{Parseable,SummaryDisk};
+use crate::types::DigestBytes;
+use crate::types::my_summary_disk;
 
 const VO_MAGIC:i32 = 8991;
 
@@ -28,6 +29,11 @@ impl E {
     pub fn len(actual: usize, expected: usize, name: &str, i:&[u8]) -> Result<(),Self> {
         E::msg(format!("Struct {}: expected size {}, got size {}", name, expected, actual), i)
     }
+    fn new(input: &[u8], msg: String) -> Self {
+        E{ 
+            stuff: vec![(input.len(), msg)]
+        }
+    }
 }
 
 impl<'a> ParseError<&'a[u8]> for E {
@@ -42,15 +48,7 @@ impl<'a> ParseError<&'a[u8]> for E {
     }
 }
 
-impl E {
-    fn new(input: &[u8], msg: &str) -> Self {
-        E{ 
-            stuff: vec![(input.len(), msg.to_string())]
-        }
-    }
-}
-
-fn fail<'a,T>(input: &'a[u8], msg: &str) -> IResult<&'a[u8],T,E> {
+pub fn fail<'a,T>(input: &'a[u8], msg: String) -> IResult<&'a[u8],T,E> {
     Err(nom::Err::Failure(E::new(input,msg)))
 }
 
@@ -94,17 +92,8 @@ pub enum Data {
     Atm(u8)
 }
 
-pub enum MemoryCell {
-    ConstructionPhase1,
-    Struct(u8,Vec<Data>),
-    Int63(u63),
-    String(Vec<u8>),
-    ConstructionPhase2,
-    Ref(Rc<dyn Any>)
-}
-
 pub struct Memory {
-    cells: Vec<MemoryCell>
+    cells: Vec<Option<Rc<dyn Any>>>
 }
 
 pub struct SemanticError {
@@ -123,53 +112,6 @@ impl SemanticError {
     }
 }
 
-impl Data {
-    pub fn resolve_nullable<T:Parseable>(&self, memory: &mut Memory) -> Result<Option<Rc<T>>,SemanticError> {
-        match self {
-            Data::Ptr(addr) => Ok(Some(memory.resolve_ptr(*addr)?)),
-            Data::Int(0) => Ok(None),
-            _ => Err(SemanticError{msg:format!("resolve_nullable: expected ptr or int(0)")})
-        }
-    }
-    pub fn resolve_ref<T:Parseable>(&self, memory: &mut Memory) -> Result<Rc<T>,SemanticError> {
-        match self {
-            Data::Ptr(addr) => memory.resolve_ptr(*addr),
-            _ => Err(SemanticError{msg:format!("resolve_ref: expected ptr")})
-        }
-    }
-    pub fn resolve_int<T:Parseable>(&self) -> Result<i64,SemanticError> {
-        match self {
-            Data::Int(n) => Ok(*n),
-            _ => Err(SemanticError{msg:format!("resolve_int: expected int")})
-        }
-    }
-}
-
-impl std::fmt::Debug for MemoryCell {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(),std::fmt::Error> {
-        match self {
-            MemoryCell::ConstructionPhase1 => write!(f, "ConstructionPhase1")?,
-            MemoryCell::Struct(tag,data) => write!(f, "Struct({},{:?})", tag, data)?,
-            MemoryCell::Int63(n) => write!(f, "Int63({})", n)?,
-            MemoryCell::String(data) => write!(f, "String({})", as_string(&data))?,
-            MemoryCell::ConstructionPhase2 => write!(f, "ConstructionPhase2")?,
-            MemoryCell::Ref(_) => write!(f, "Ref()")?,
-        }
-        Ok(())
-    }
-}
-
-impl MemoryCell {
-    fn is_under_construction1(&self) -> bool {
-        match self {
-            MemoryCell::ConstructionPhase1 => true,
-            MemoryCell::ConstructionPhase2 => panic!(),
-            MemoryCell::Ref(_) => panic!(),
-            _ => false
-        }
-    }
-}
-
 impl Memory {
     fn with_capacity(size: usize) -> Self {
         Memory{cells: Vec::with_capacity(size)}
@@ -177,52 +119,32 @@ impl Memory {
     fn len(&self) -> usize {
         self.cells.len()
     }
-    fn point_back(&mut self, offset: usize) -> Result<Data,SemanticError> {
+    fn push<T:'static>(&mut self, rc: Rc<T>) {
+        self.cells.push(Some(rc))
+    }
+    fn point_back2<T:'static>(&mut self, offset: usize) -> Result<Rc<T>,SemanticError> {
         let index = self.cells.len() - offset;
         if index >= self.cells.len() {
             return SemanticError::msg(format!("Pointer is to next object, is this allowed?"));
         }
-        if self.cells[index].is_under_construction1() {
-            return SemanticError::msg(format!("Pointer is to object that we haven't finished building, is this allowed?"));
+        match &self.cells[index] {
+            Some(rc) => rc.clone().downcast().map_err(|rc|SemanticError::new(format!("downcasting error on pointer"))),
+            _ => SemanticError::msg(format!("Pointer is to object that we haven't finished building, is this allowed?"))
         }
-        Ok(Data::Ptr(index))
-    }
-    fn add_string(&mut self, data: Vec<u8>) -> Data {
-        self.cells.push(MemoryCell::String(data));
-        Data::Ptr(self.cells.len() - 1)
-    }
-    fn add_int63(&mut self, n: u63) -> Data {
-        self.cells.push(MemoryCell::Int63(n));
-        Data::Ptr(self.cells.len() - 1)
     }
     fn reserve_for_struct(&mut self) -> usize {
-        self.cells.push(MemoryCell::ConstructionPhase1);
+        self.cells.push(None);
         self.cells.len() - 1
     }
-    fn backfill_struct(&mut self, addr: usize, tag: u8, data: Vec<Data>) -> Data {
+    fn backfill_struct2<T:'static>(&mut self, addr: usize, data: T) -> Rc<T> {
         match self.cells[addr] {
-            MemoryCell::ConstructionPhase1 => {
-                self.cells[addr] = MemoryCell::Struct(tag, data);
-                Data::Ptr(addr)
+            None => {
+                let rc = Rc::new(data);
+                self.cells[addr] = Some(rc.clone());
+                rc
             }
-            _ => panic!("backfill_struct: expecting cell to be in state ConstructionPhase1")
+            _ => panic!("backfill_struct: expecting cell to be under construction")
         }
-    }
-    fn resolve_ptr<T:Parseable>(&mut self, addr: usize) -> Result<Rc<T>,SemanticError> {
-        match &self.cells[addr] {
-            MemoryCell::Ref(rc) => {
-                return rc.clone().downcast().map_err(|rc|SemanticError::new(format!("downcasting error on pointer")));
-            }
-            _ => {}
-        }
-
-        let mut cell = MemoryCell::ConstructionPhase2;
-        swap(&mut cell, &mut self.cells[addr]);
-
-        let t = T::from_cell(self, cell)?;
-        let rc = Rc::new(t);
-        self.cells[addr] = MemoryCell::Ref(rc.clone());
-        Ok(rc)
     }
 }
 
@@ -233,7 +155,7 @@ fn vo_magic(i: &[u8]) -> IResult<&[u8],(),E> {
     if magic == VO_MAGIC {
         Ok((i,()))
     } else {
-        fail(i,&format!("vo_magic {}", VO_MAGIC))
+        fail(i,format!("vo_magic {}", VO_MAGIC))
     }
 }
 
@@ -267,7 +189,7 @@ fn cstring(i: &[u8]) -> IResult<&[u8],&[u8],E> {
 fn be_u63(i: &[u8]) -> IResult<&[u8], u63, E> {
     let (i,n) = be_i64(i)?;
     if n < 0 {
-        fail(i, &format!("uint63 out of range: {}", n))
+        fail(i, format!("uint63 out of range: {}", n))
     } else {
         Ok((i,n as u63))
     }
@@ -344,7 +266,7 @@ fn parse_object(i: &[u8]) -> IResult<&[u8],Repr,E> {
                     let (i,n) = be_u63(i)?;
                     Ok((i,Repr::RInt63(n)))
                 }
-                _ => fail(i, &format!("Unhandled custom code: {:?}", std::str::from_utf8(string)))
+                _ => fail(i, format!("Unhandled custom code: {:?}", std::str::from_utf8(string)))
             }
         }
         CODE_DOUBLE_ARRAY32_LITTLE|
@@ -356,54 +278,180 @@ fn parse_object(i: &[u8]) -> IResult<&[u8],Repr,E> {
             CODE_INFIXPOINTER|
             20..=31 =>
         {
-            fail(i, &format!("Unhandled code: {:02x}", data))
+            fail(i, format!("Unhandled code: {:02x}", data))
         }
     }
 }
 
-pub fn fill_obj<'a>(memory: &mut Memory, i: &'a[u8]) -> IResult<&'a[u8], Data, E> {
+pub fn string<'b,F,T:'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<T>,E>
+    where F:Fn(Vec<u8>) -> Result<T,SemanticError>
+{
+    move|memory,i| {
+        let (i,r) = parse_object(i)?;
+        match r {
+            Repr::RPointer(n) => {
+                let rc = memory.point_back2(n).map_err(|e|e.to_nom(i))?;
+                Ok((i,rc))
+            }
+            Repr::RString(s) => {
+                let data = f(s).map_err(|e|e.to_nom(i))?;
+                let rc = Rc::new(data);
+                memory.push(rc.clone());
+                Ok((i,rc))
+            }
+            _ => fail(i, format!("Expected string or pointer to string, got {:?}", r))
+        }
+    }
+}
+
+pub fn int<'b,'a>(memory: &'a mut Memory, i:&'b[u8]) -> IResult<&'b[u8],i64,E>
+{
     let (i,r) = parse_object(i)?;
     match r {
-        Repr::RPointer(n) => {
-            let data = memory.point_back(n).map_err(|e|e.to_nom(i))?;
-            Ok((i,data))
-        }
         Repr::RInt(n) => {
-            let data = Data::Int(n);
-            Ok((i,data))
+            Ok((i,n))
         }
-        Repr::RString(s) => {
-            let data = memory.add_string(s);
-            Ok((i,data))
-        }
-        Repr::RBlock(tag,len) => {
-            if len == 0 {
-                let data = Data::Atm(tag);
-                Ok((i,data))
-            } else {
-                let index = memory.reserve_for_struct();
-                let mut nblock = Vec::with_capacity(len);
-                let mut i = i;
-                for _ in 0..len {
-                    let (newi, d) = fill_obj(memory, i)?;
-                    i = newi;
-                    nblock.push(d);
-                }
-                let data = memory.backfill_struct(index, tag, nblock);
-                Ok((i,data))
+        _ => fail(i, format!("Expected int, got {:?}", r))
+    }
+}
+
+pub fn block<'b,F,T:'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<T>,E>
+    where F:Fn(usize, &mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
+{
+    move|memory,i| {
+        let (i,r) = parse_object(i)?;
+        match r {
+            Repr::RPointer(n) => {
+                let rc = memory.point_back2(n).map_err(|e|e.to_nom(i))?;
+                Ok((i,rc))
             }
-        }
-        Repr::RCode(_addr) => {
-            fail(i, "We shouldn't serialize closures?")
-        }
-        Repr::RInt63(n) => {
-            let data = memory.add_int63(n);
-            Ok((i,data))
+            Repr::RBlock(0,len) if len>0 => {
+                let index = memory.reserve_for_struct();
+                let (i,data) = f(len, memory, i)?;
+                let rc = memory.backfill_struct2(index, data);
+                Ok((i,rc))
+            }
+            _ => fail(i, format!("Expected block or pointer to array, got {:?}", r))
         }
     }
 }
 
-fn as_string(string: &[u8]) -> String {
+pub fn vec<'b,F,T:'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<Vec<T>>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
+{
+    block(move|len,memory,i| {
+        let mut nblock = Vec::with_capacity(len);
+        let mut i = i;
+        for _ in 0..len {
+            let (newi, d) = f(memory, i)?;
+            i = newi;
+            nblock.push(d);
+        }
+        Ok((i,nblock))
+    })
+}
+
+pub fn block1<'b,F,M,T:'static,R:'static>(f:F,m:M) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<R>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+          M:Fn(T) -> Result<R,SemanticError>
+{
+    block(move|len,memory,i| {
+        if len == 1 {
+            let (i,a) = f(memory, i)?;
+            let data = m(a).map_err(|e|e.to_nom(i))?;
+            Ok((i,data))
+        } else {
+            fail(i, format!("tuple1: actual block length was {}", len))
+        }
+    })
+}
+
+pub fn block2<'b,F,G,M,T:'static,U:'static,R:'static>(f:F,g:G,m:M) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<R>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+          G:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],U,E>,
+          M:Fn(T,U) -> Result<R,SemanticError>
+{
+    block(move|len,memory,i| {
+        if len == 2 {
+            let (i,a) = f(memory, i)?;
+            let (i,b) = g(memory, i)?;
+            let data = m(a,b).map_err(|e|e.to_nom(i))?;
+            Ok((i,data))
+        } else {
+            fail(i, format!("tuple2: actual block length was {}", len))
+        }
+    })
+}
+
+pub fn block3<'b,F,G,H,M,T:'static,U:'static,V:'static,R:'static>(f:F,g:G,h:H,m:M) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<R>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+          G:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],U,E>,
+          H:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],V,E>,
+          M:Fn(T,U,V) -> Result<R,SemanticError>
+{
+    block(move|len,memory,i| {
+        if len == 3 {
+            let (i,a) = f(memory, i)?;
+            let (i,b) = g(memory, i)?;
+            let (i,c) = h(memory, i)?;
+            let data = m(a,b,c).map_err(|e|e.to_nom(i))?;
+            Ok((i,data))
+        } else {
+            fail(i, format!("tuple3: actual block length was {}", len))
+        }
+    })
+}
+
+pub fn wrapped<'b,F,T:'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<T>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
+{
+    block1(f,|a|Ok(a))
+}
+
+pub fn tuple2<'b,F,G,T:'static,U:'static>(f:F,g:G) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<(T,U)>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+          G:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],U,E>
+{
+    block2(f,g,|a,b|Ok((a,b)))
+}
+
+fn unshare<T:Clone>(rc: Rc<T>) -> T {
+    match Rc::try_unwrap(rc) {
+        Ok(item) => item,
+        Err(rc) => (*rc).clone()
+    }
+}
+
+pub fn my<'b,F,T:Clone+'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<T>,E>,
+{
+    move|memory,i| {
+        let (i,rc) = f(memory,i)?;
+        Ok((i, unshare(rc)))
+    }
+}
+
+// Treats int(0) as a special null value
+pub fn nullable<'b,F,T:Clone+'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Option<T>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+{
+    move|memory,i| {
+        let (newi,r) = parse_object(i)?;
+        match r {
+            Repr::RInt(0) => {
+                Ok((newi,None))
+            }
+            _ => {
+                // backtrack
+                let (i, data) = f(memory,i)?;
+                Ok((i, Some(data)))
+            }
+        }
+    }
+}
+
+
+pub fn as_string(string: &[u8]) -> String {
     let result = std::str::from_utf8(string);
     if result.is_ok() {
         result.unwrap().to_string()
@@ -411,52 +459,27 @@ fn as_string(string: &[u8]) -> String {
         format!("{:?}", string)
     }
 }
-/*
 
-fn print_data(data: &Data, indent: usize) {
-    for _ in 0..indent {
-        print!(" ");
-    }
-    match data {
-        Data::Ptr(rc) => {
-            print!("Ptr -> ");
-            match &**rc {
-                Obj::String(s) => println!("{}", as_string(s)),
-                Obj::Int63(n) => println!("{}", n),
-                Obj::Struct(t,block) => {
-                    println!("Struct({})", t);
-                    for item in block {
-                        print_data(item, indent + 4);
-                    }
-                }
-            }
-        }
-        Data::Int(n) => println!("Int({})", n),
-        Data::Atm(t) => println!("Atm({})", t)
-    }
-}
-*/
-
-fn segment<T:Parseable>(file_len: usize, i: &[u8]) -> IResult<&[u8],(Rc<T>,usize,&[u8]),E> {
+fn segment<'b,'a:'b,F,T:Clone+Sized+'static>(f:F, file_len: usize, i:&'b[u8]) -> IResult<&'b[u8],(T,usize,DigestBytes),E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
+{
     let (i,stop) = be_i32(i)?;
     let (i,(len,_,_,size)) = header(i)?;
     let orig_pos = i.len();
     let mut memory= Memory::with_capacity(size as usize);
-    let (i,root) = fill_obj(&mut memory, i)?;
+    let (i,obj) = f(&mut memory,i)?;
     if memory.len() != size as usize {
-        fail::<()>(i, &format!("Memory should be length {}, was actually {}", size, memory.len()))?;
+        return fail(i, format!("Memory should be length {}, was actually {}", size, memory.len()));
     }
     if orig_pos - i.len() != len as usize {
-        fail::<()>(i, &format!("Expected to consume {} bytes, actually consumed {}", len, orig_pos - i.len()))?;
+        return fail(i, format!("Expected to consume {} bytes, actually consumed {}", len, orig_pos - i.len()));
     }
     if file_len - i.len() != stop as usize {
-        fail::<()>(i, &format!("Expected to stop at {}, actually stopped at {}", stop, file_len - i.len()))?;
+        return fail(i, format!("Expected to stop at {}, actually stopped at {}", stop, file_len - i.len()));
     }
     let (i,digest) = take(16usize)(i)?;
 
-    let obj = root.resolve_ref::<T>(&mut memory).map_err(|e|e.to_nom(i))?;
-
-    Ok((i,(obj,stop as usize,digest)))
+    Ok((i,(obj,stop as usize,DigestBytes::new(digest))))
 }
 
 fn md5(i: &[u8]) -> Vec<u8> {
@@ -469,8 +492,8 @@ fn file_contents(i: &[u8]) -> IResult<&[u8],(),E> {
     let entire_file = i;
     let file_len = i.len();
     let (i,_) = vo_magic(i)?;
-    let (i,(summary_disk,_,_)) = segment::<SummaryDisk>(file_len,i)?;
-    debug!("{:?}", summary_disk);
+    let (i,(summary_disk,_,_)) = segment(my_summary_disk,file_len,i)?;
+    debug!("{:#?}", summary_disk);
 /*    let (i,(_library_disk,_,digest)) = segment(file_len,i)?;
     let (i,(_opaque_csts,_,udg)) = segment(file_len,i)?;
     let (i,(_tasks,_,_)) = segment(file_len,i)?;
