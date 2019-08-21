@@ -10,7 +10,7 @@ use nom::error::{ErrorKind,ParseError};
 use nom::number::complete::{be_i8,be_i16,be_i32,be_i64,be_u8,be_u16,be_u24,be_u32,be_u64};
 
 use crate::types::DigestBytes;
-use crate::types::my_summary_disk;
+use crate::types::SummaryDisk;
 
 const VO_MAGIC:i32 = 8991;
 
@@ -50,6 +50,16 @@ impl<'a> ParseError<&'a[u8]> for E {
 
 pub fn fail<'a,T>(input: &'a[u8], msg: String) -> IResult<&'a[u8],T,E> {
     Err(nom::Err::Failure(E::new(input,msg)))
+}
+
+//////////////////////////////////////////////////////
+
+pub trait VoParseRef where Self:Sized+Clone {
+    fn parse_ref<'b>(memory: &mut Memory, input: &'b[u8]) -> IResult<&'b[u8],Rc<Self>,E>;
+    fn parse_val<'b>(memory: &mut Memory, input: &'b[u8]) -> IResult<&'b[u8],Self,E> {
+        let (i,rc) = Self::parse_ref(memory, input)?;
+        Ok((i,unshare(rc)))
+    }
 }
 
 //////////////////////////////////////////////////////
@@ -402,6 +412,30 @@ pub fn block3<'b,F,G,H,M,T:'static,U:'static,V:'static,R:'static>(f:F,g:G,h:H,m:
     })
 }
 
+pub fn block5<'b,F,G,H,I,J,M,T:'static,U:'static,V:'static,W:'static,X:'static,R:'static>(f:F,g:G,h:H,i:I,j:J,m:M)
+    -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<R>,E>
+    where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>,
+          G:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],U,E>,
+          H:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],V,E>,
+          I:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],W,E>,
+          J:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],X,E>,
+          M:Fn(T,U,V,W,X) -> Result<R,SemanticError>
+{
+    block(move|len,memory,input| {
+        if len == 5 {
+            let (input,a) = f(memory, input)?;
+            let (input,b) = g(memory, input)?;
+            let (input,c) = h(memory, input)?;
+            let (input,d) = i(memory, input)?;
+            let (input,e) = j(memory, input)?;
+            let data = m(a,b,c,d,e).map_err(|err|err.to_nom(input))?;
+            Ok((input,data))
+        } else {
+            fail(input, format!("tuple3: actual block length was {}", len))
+        }
+    })
+}
+
 pub fn wrapped<'b,F,T:'static>(f:F) -> impl Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],Rc<T>,E>
     where F:Fn(&mut Memory, &'b[u8]) -> IResult<&'b[u8],T,E>
 {
@@ -415,7 +449,7 @@ pub fn tuple2<'b,F,G,T:'static,U:'static>(f:F,g:G) -> impl Fn(&mut Memory, &'b[u
     block2(f,g,|a,b|Ok((a,b)))
 }
 
-fn unshare<T:Clone>(rc: Rc<T>) -> T {
+pub fn unshare<T:Clone>(rc: Rc<T>) -> T {
     match Rc::try_unwrap(rc) {
         Ok(item) => item,
         Err(rc) => (*rc).clone()
@@ -492,7 +526,7 @@ fn file_contents(i: &[u8]) -> IResult<&[u8],(),E> {
     let entire_file = i;
     let file_len = i.len();
     let (i,_) = vo_magic(i)?;
-    let (i,(summary_disk,_,_)) = segment(my_summary_disk,file_len,i)?;
+    let (i,(summary_disk,_,_)) = segment(SummaryDisk::parse_val,file_len,i)?;
     debug!("{:#?}", summary_disk);
 /*    let (i,(_library_disk,_,digest)) = segment(file_len,i)?;
     let (i,(_opaque_csts,_,udg)) = segment(file_len,i)?;
